@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 #include <CommonCrypto/CommonDigest.h>
@@ -232,7 +233,9 @@ void backendDeferredSubmission(const std::string &metallibPath) {
 BOOL noPlacementSupport(id, SEL) { return NO; }
 BOOL failPlacementQuery(id, SEL) {
     id<MTLDevice> backing = (id<MTLDevice>)[NSObject new];
-    return backing.supportsPlacementSparse;
+    using Query = BOOL (*)(id, SEL);
+    return reinterpret_cast<Query>(objc_msgSend)(backing,
+                                                 sel_registerName("supportsPlacementSparse"));
 }
 id<MTLHeap> refuseProbeHeap(id, SEL, MTLHeapDescriptor *) { return nil; }
 uint64_t failedProbeWaitValue = 0;
@@ -696,7 +699,7 @@ void run(const std::string &metallibPath) {
             "recommended working set capability is missing");
     require(capabilities.maxBufferLengthBytes > 0,
             "maximum buffer length capability is missing");
-    require(capabilities.appleGpuFamily >= 9,
+    require(capabilities.appleGpuFamily >= 7,
             "Apple GPU family capability is missing");
     require(capabilities.maxThreadgroupMemoryBytes >= 32 * 1024,
             "threadgroup memory capability is insufficient");

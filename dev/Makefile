@@ -38,7 +38,20 @@ HTTP_SMOKE_ARGS ?=
 	install-development release-check test test-agent-real test-http-real \
 	test-performance-real test-release-real \
 	test-models test-python test-real \
-	test-engine test-engine-cpu test-engine-metal test-sanitizers
+	test-engine test-engine-cpu test-engine-metal test-sanitizers \
+	m1-ultra-smoke
+
+# This probe deliberately has no production-kernel or model prerequisite. It
+# can run while the optional Xcode Metal toolchain is unavailable and records
+# the real MTLDevice, pipeline, counter, and placement-sparse capabilities.
+M1_ULTRA_SMOKE := $(BUILD)/m1-ultra-capability-probe
+
+m1-ultra-smoke: $(M1_ULTRA_SMOKE)
+	@$(M1_ULTRA_SMOKE)
+
+$(M1_ULTRA_SMOKE): dev/tools/m1_ultra_capability_probe.mm
+	@mkdir -p $(dir $@)
+	$(CXX) $(ENGINE_OBJCXXFLAGS) $< $(ENGINE_LINKFLAGS) -o $@
 
 install-development: install-environment $(DEV_STAMP)
 

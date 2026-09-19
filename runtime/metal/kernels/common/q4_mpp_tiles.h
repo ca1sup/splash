@@ -2,6 +2,136 @@
 
 #include "metal/abi/KernelABI.h"
 
+#if SPLASH_APPLE7
+
+// Apple7 has BF16 and SIMD matrix support, but its Metal compiler does not
+// expose the packed uint4b_format tensor element used by the newer kernels.
+// Keep the package's byte layout (two low/high nibbles per input pair) and
+// perform a bounded scalar unpack inside each cooperative threadgroup. This
+// is the correctness-first Apple7 reference; its tile and group policy is
+// intentionally measured separately from the tensor path.
+inline uint q4_apple7_nibble(device const uchar *column, uint index) {
+  const uchar packed = column[index >> 1];
+  return (index & 1) ? uint(packed >> 4) : uint(packed & 0x0f);
+}
+
+inline float q4_apple7_value(device const bfloat *input, uint input_origin,
+                             device const uchar *weights, uint weight_origin,
+                             device const bfloat *scale,
+                             device const bfloat *bias, uint parameter) {
+  float dot = 0.0f;
+  float sum = 0.0f;
+  for (uint index = 0; index < 64; ++index) {
+    const float value = float(input[input_origin + index]);
+    dot += value * float(q4_apple7_nibble(weights + weight_origin, index));
+    sum += value;
+  }
+  return dot * float(scale[parameter]) + sum * float(bias[parameter]);
+}
+
+template <ushort TileN, bool GateUp, bool AddResidual,
+          ushort StorageN = TileN, bool Pipelined = false>
+inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
+                        device bfloat *scales_0, device bfloat *biases_0,
+                        device bfloat *output_0, device uchar *weights_1,
+                        device bfloat *scales_1, device bfloat *biases_1,
+                        device bfloat *residual, uint output_size,
+                        uint input_size, threadgroup float *,
+                        uint output_origin, uint simd_lane, uint simd_group) {
+  constexpr uint Rows = 8;
+  constexpr uint Workers = 8 * 32;
+  const uint worker = simd_group * 32 + simd_lane;
+  const uint quant_groups = input_size / 64;
+  const uint tile = output_origin / StorageN;
+  const uint tile_offset = output_origin % StorageN;
+  for (uint task = worker; task < Rows * TileN; task += Workers) {
+    const uint row = task / TileN;
+    const uint column = task % TileN;
+    float value0 = 0.0f;
+    float value1 = 0.0f;
+    for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+      const uint parameter = (tile * quant_groups + quant_group) * StorageN +
+                             tile_offset + column;
+      const uint weightColumn =
+          tile * quant_groups * StorageN + quant_group * StorageN +
+          tile_offset + column;
+      const uint weightOrigin = weightColumn * 32;
+      const uint inputOrigin = row * input_size + quant_group * 64;
+      value0 += q4_apple7_value(input, inputOrigin, weights_0, weightOrigin,
+                                scales_0, biases_0, parameter);
+      if constexpr (GateUp)
+        value1 += q4_apple7_value(input, inputOrigin, weights_1, weightOrigin,
+                                  scales_1, biases_1, parameter);
+    }
+    float result;
+    if constexpr (GateUp) {
+      const float gate = float(bfloat(value0));
+      const float up = float(bfloat(value1));
+      result = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
+    } else {
+      result = float(bfloat(value0));
+    }
+    if constexpr (AddResidual)
+      result += float(residual[row * output_size + output_origin + column]);
+    output_0[row * output_size + output_origin + column] = bfloat(result);
+  }
+  (void)Pipelined;
+}
+
+template <ushort Rows, ushort TileN, bool GateUp, bool AddResidual,
+          ushort StorageN = TileN, bool MultiplySiluGate = false,
+          ushort Simdgroups = 8>
+inline void q4_mpp_tile_batched(
+    device bfloat *input, device uchar *weights_0, device bfloat *scales_0,
+    device bfloat *biases_0, device bfloat *output_0, device uchar *weights_1,
+    device bfloat *scales_1, device bfloat *biases_1, device bfloat *residual,
+    uint output_size, uint input_size, threadgroup float *,
+    uint output_origin, uint simd_lane, uint simd_group) {
+  const uint worker = simd_group * 32 + simd_lane;
+  const uint workers = uint(Simdgroups) * 32;
+  const uint quant_groups = input_size / 64;
+  const uint tile = output_origin / StorageN;
+  const uint tile_offset = output_origin % StorageN;
+  for (uint task = worker; task < Rows * TileN; task += workers) {
+    const uint row = task / TileN;
+    const uint column = task % TileN;
+    float value0 = 0.0f;
+    float value1 = 0.0f;
+    for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+      const uint parameter = (tile * quant_groups + quant_group) * StorageN +
+                             tile_offset + column;
+      const uint weightColumn =
+          tile * quant_groups * StorageN + quant_group * StorageN +
+          tile_offset + column;
+      const uint weightOrigin = weightColumn * 32;
+      const uint inputOrigin = row * input_size + quant_group * 64;
+      value0 += q4_apple7_value(input, inputOrigin, weights_0, weightOrigin,
+                                scales_0, biases_0, parameter);
+      if constexpr (GateUp)
+        value1 += q4_apple7_value(input, inputOrigin, weights_1, weightOrigin,
+                                  scales_1, biases_1, parameter);
+    }
+    float result;
+    const uint outputIndex = row * output_size + output_origin + column;
+    if constexpr (GateUp) {
+      const float gate = float(bfloat(value0));
+      const float up = float(bfloat(value1));
+      result = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * up;
+    } else if constexpr (MultiplySiluGate) {
+      const float gate = float(residual[outputIndex]);
+      result = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) *
+               float(bfloat(value0));
+    } else {
+      result = float(bfloat(value0));
+    }
+    if constexpr (AddResidual)
+      result += float(residual[outputIndex]);
+    output_0[outputIndex] = bfloat(result);
+  }
+}
+
+#else
+
 // Q4 (4-bit, group 64, StorageN=256) tiles shared by dense and MoE projections.
 // A threadgroup computes Rows x TileN outputs with fp32 accumulation and a
 // per-quant-group scale/bias epilogue.
@@ -347,3 +477,5 @@ inline void q4_mpp_tile_batched(
   // Same next-tile hazard on input-sum region 0 as q4_mpp_tile.
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
+
+#endif

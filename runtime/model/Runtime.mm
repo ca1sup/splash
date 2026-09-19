@@ -2656,7 +2656,7 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
                                      const ops::ExecutionPlans &operators) {
   requireCompatibleModelPackage(package);
   if (device.appleGpuFamily < DeviceCapabilities::kMinimumAppleGpuFamily) {
-    throw std::invalid_argument("model runtime requires Apple tensor BF16");
+    throw std::invalid_argument("model runtime requires Apple7 tensor BF16");
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package);
   return {package.stateLayout().activeCellBytes(),

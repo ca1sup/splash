@@ -4,6 +4,8 @@
 #include <iostream>
 #include <string>
 
+#import <objc/message.h>
+
 @interface SparseDevice : NSObject
 @property BOOL supportsPlacementSparse;
 @end
@@ -18,7 +20,9 @@
 @implementation ForwardingDevice
 - (BOOL)supportsPlacementSparse {
     id<MTLDevice> backing = (id<MTLDevice>)[NSObject new];
-    return backing.supportsPlacementSparse;
+    using Query = BOOL (*)(id, SEL);
+    return reinterpret_cast<Query>(objc_msgSend)(backing,
+                                                 sel_registerName("supportsPlacementSparse"));
 }
 @end
 

@@ -254,9 +254,19 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   validate(w);
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
+  const bool apple7 = appleGpuFamily_ == 7;
   if (w.phase == LinearPhase::Prefill) {
     if (appleGpuFamily_ >= 10)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
+    if (apple7 && w.epilogue == LinearEpilogue::UpWithGate)
+      // Apple7's reference path keeps the fused gate/up workload on the
+      // already-supported N256 ABI; the N128 fused kernel is sg4-only.
+      return {LinearTile::N256, 0, LinearSimdgroups::Eight};
+    if (apple7)
+      // Apple7 has the required matrix path, but these release policies were
+      // measured only on newer families. Start with the lower-register N128
+      // eight-SIMD-group kernel until an M1 sweep proves a wider tile wins.
+      return {LinearTile::N128, 0, LinearSimdgroups::Eight};
     const uint32_t rowTiles = (w.rows + kPrefillRows - 1) / kPrefillRows;
     const bool wide = double(rowTiles) * tiles256 >=
         kApple9WidePrefillGroupsPerCore * gpuCores_;
@@ -269,6 +279,17 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
     return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
                                  : tiles;
   };
+  if (apple7 && w.epilogue == LinearEpilogue::GateUp) {
+    // Gate/up has no N128 implementation. Keep its existing N256 ABI, but
+    // avoid the Apple9 resident-group estimate until measured on M1.
+    return {LinearTile::N256, std::min(tiles256, gpuCores_)};
+  }
+  if (apple7) {
+    // Avoid the paired and four-SIMD-group variants in the first Apple7
+    // reference. They remain available to the tuner as explicit candidates.
+    return {LinearTile::N128, std::min(tiles128, gpuCores_),
+            LinearSimdgroups::Eight};
+  }
   if (w.epilogue == LinearEpilogue::GateUp) {
     if (appleGpuFamily_ < 10) {
       const auto resident = static_cast<uint32_t>(

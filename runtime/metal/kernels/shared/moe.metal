@@ -31,6 +31,8 @@ inline float moe_route_group_term(float dot, float scale, float sum,
   return fma(dot, scale, sum * bias);
 }
 
+#if !SPLASH_APPLE7
+
 // Eight rows by 32 experts per threadgroup. Simdgroup s owns K slice s and
 // stages its rows in threadgroup memory, so a ragged tail never reads past
 // the last live row; the threadgroup then sums the slice partials in order.
@@ -262,6 +264,100 @@ kernel void moe_route_scores_q8_m32(
     }
   });
 }
+
+#else
+
+// Apple7 does not accept the uint8_t MPP source operand used by the upstream
+// router. Keep the same Q8 affine contract and package layout, but calculate
+// each score with ordinary scalar loads. This is deliberately a correctness
+// fallback: it keeps native tuning and sparse-model package validation alive
+// while the dense Qwen3.8 path uses the Apple7 Q4 kernels.
+inline float moe_route_score_apple7(device const bfloat *input,
+                                    device const uint8_t *router_weights,
+                                    device const bfloat *router_scales,
+                                    device const bfloat *router_biases,
+                                    uint expert, uint quant_groups) {
+  float total = 0.0f;
+  constexpr uint StorageN = 256;
+  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+    float dot = 0.0f;
+    float sum = 0.0f;
+    const ulong weight_origin =
+        (ulong(quant_group) * StorageN + expert) * 64;
+    const uint input_origin = quant_group * 64;
+    for (uint index = 0; index < 64; ++index) {
+      const float value = float(input[input_origin + index]);
+      dot += value * float(router_weights[weight_origin + index]);
+      sum += value;
+    }
+    const ulong parameter = ulong(quant_group) * StorageN + expert;
+    total += moe_route_group_term(dot, float(router_scales[parameter]), sum,
+                                  float(router_biases[parameter]));
+  }
+  return total;
+}
+
+kernel void moe_route_scores_q8_m8(
+    device bfloat *input [[buffer(0)]],
+    device uint8_t *router_weights [[buffer(1)]],
+    device bfloat *router_scales [[buffer(2)]],
+    device bfloat *router_biases [[buffer(3)]],
+    device bfloat *scores [[buffer(4)]],
+    constant MoeRouteParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint Rows = 8;
+  constexpr uint TileN = 32;
+  constexpr uint StorageN = 256;
+  const uint row_base = group.x * Rows;
+  const uint expert_origin = group.y * TileN;
+  const uint quant_groups = params.input_size / 64;
+  if (row_base >= params.rows)
+    return;
+  const uint live_rows = min(Rows, params.rows - row_base);
+  for (uint task = thread_index; task < Rows * TileN;
+       task += 256) {
+    const uint row = task / TileN;
+    const uint expert = expert_origin + task % TileN;
+    if (row < live_rows)
+      scores[ulong(row_base + row) * StorageN + expert] = bfloat(
+          moe_route_score_apple7(input + ulong(row_base + row) * params.input_size,
+                                 router_weights, router_scales, router_biases,
+                                 expert, quant_groups));
+  }
+}
+
+kernel void moe_route_scores_q8_m32(
+    device bfloat *input [[buffer(0)]],
+    device uint8_t *router_weights [[buffer(1)]],
+    device bfloat *router_scales [[buffer(2)]],
+    device bfloat *router_biases [[buffer(3)]],
+    device bfloat *scores [[buffer(4)]],
+    constant MoeRouteParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint Rows = 32;
+  constexpr uint TileN = 128;
+  constexpr uint StorageN = 256;
+  const uint row_base = group.x * Rows;
+  const uint expert_origin = group.y * TileN;
+  const uint quant_groups = params.input_size / 64;
+  if (row_base >= params.rows)
+    return;
+  const uint live_rows = min(Rows, params.rows - row_base);
+  for (uint task = thread_index; task < Rows * TileN;
+       task += 256) {
+    const uint row = task / TileN;
+    const uint expert = expert_origin + task % TileN;
+    if (row < live_rows)
+      scores[ulong(row_base + row) * StorageN + expert] = bfloat(
+          moe_route_score_apple7(input + ulong(row_base + row) * params.input_size,
+                                 router_weights, router_scales, router_biases,
+                                 expert, quant_groups));
+  }
+}
+
+#endif
 
 // One row per threadgroup: thread e holds expert e's score, the threadgroup
 // reduces the shared expert's scalar gate with a fixed partial-sum order, and

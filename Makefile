@@ -40,7 +40,10 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 # startup; every binary and metallib records the same floor.
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
+SPLASH_APPLE7 ?= 0
+SPLASH_APPLE7_FLAG = -DSPLASH_APPLE7=$(if $(filter 1 true yes,$(SPLASH_APPLE7)),1,0)
+PROD_METALFLAGS = -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
+	$(SPLASH_APPLE7_FLAG) \
 	$(MACOS_TARGET_FLAG)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
@@ -48,7 +51,13 @@ ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
-	platform-check model-selection preflight serve verify-models
+	platform-check model-selection preflight serve verify-models m1-ultra
+
+# Keep the upstream Apple9/Apple10 package as the default. The Apple7 source
+# set is an explicit M1 build preset because Metal must compile out the newer
+# packed-tensor specializations rather than choose between them at runtime.
+m1-ultra:
+	$(MAKE) SPLASH_APPLE7=1 all
 
 all: $(TARGET)
 
@@ -192,6 +201,7 @@ PRODUCTION_ENGINE_INPUTS := $(sort $(shell find runtime -type f \
 	-print))
 BUILD_ID_CONSTANT_ARGS = \
 	--constant 'runtime=qwen-hybrid-dflash8' \
+	--constant 'splash_apple7=$(SPLASH_APPLE7)' \
 	--constant 'engine_cxxflags=$(ENGINE_CXXFLAGS)' \
 	--constant 'engine_objcxxflags=$(ENGINE_OBJCXXFLAGS)' \
 	--constant 'engine_linkflags=$(ENGINE_LINKFLAGS)' \

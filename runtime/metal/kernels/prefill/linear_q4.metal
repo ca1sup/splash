@@ -23,6 +23,8 @@ kernel void prefill_linear_q4_sums32(device const bfloat *input [[buffer(0)]],
   }
 }
 
+#if !SPLASH_APPLE7
+
 // Eligible Apple9/Apple10 devices allow 32 KiB of static threadgroup memory.
 // Keeping 256 row sums resident lets the 5120/6144-wide projections run with
 // one load and the 17408-wide down projection with only one refill.
@@ -335,3 +337,160 @@ kernel void prefill_linear_q4_n128_up_silu_sums_sg4(
       output + output_offset, output_sums, params.output_size,
       output_tile * TileN, simd_lane, simd_group);
 }
+
+#else
+
+template <ushort TileM, ushort TileN, ushort Simdgroups, bool AddResidual,
+          bool MultiplySiluGate>
+inline void q4_apple7_prefill_tile(
+    device bfloat *input, device uchar *weights, device bfloat *scales,
+    device bfloat *biases, device bfloat *output, device bfloat *auxiliary,
+    uint output_size, uint input_size, device const float *precomputed_sums,
+    uint output_origin, uint simd_lane, uint simd_group) {
+  const uint worker = simd_group * 32 + simd_lane;
+  const uint workers = uint(Simdgroups) * 32;
+  const uint quant_groups = input_size / 64;
+  constexpr uint WeightTileN = 256;
+  const uint tile = output_origin / WeightTileN;
+  const uint tile_column = output_origin % WeightTileN;
+  for (uint task = worker; task < uint(TileM) * TileN; task += workers) {
+    const uint row = task / TileN;
+    const uint column = task % TileN;
+    float value = 0.0f;
+    for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+      const uint parameter = (tile * quant_groups + quant_group) * WeightTileN +
+                             tile_column + column;
+      const uint weightColumn = tile * quant_groups * WeightTileN +
+                                quant_group * WeightTileN + tile_column + column;
+      const uint weightOrigin = weightColumn * 32;
+      float dot = 0.0f;
+      const uint inputOrigin = row * input_size + quant_group * 64;
+      for (uint index = 0; index < 64; ++index) {
+        dot += float(input[inputOrigin + index]) *
+               float(q4_apple7_nibble(weights + weightOrigin, index));
+      }
+      value += dot * float(scales[parameter]) +
+               precomputed_sums[quant_group * TileM + row] *
+                   float(biases[parameter]);
+    }
+    const uint outputIndex = row * output_size + output_origin + column;
+    value = float(bfloat(value));
+    if constexpr (MultiplySiluGate) {
+      const float gate = float(auxiliary[outputIndex]);
+      value = gate / (1.0f + fast::exp2(-1.44269504089f * gate)) * value;
+    }
+    if constexpr (AddResidual)
+      value += float(auxiliary[outputIndex]);
+    output[outputIndex] = bfloat(value);
+  }
+}
+
+template <ushort TileM, ushort TileN, ushort Simdgroups>
+inline void q4_apple7_write_output_sums(device const bfloat *output,
+                                        device float *output_sums,
+                                        uint output_size, uint output_origin,
+                                        uint simd_lane, uint simd_group) {
+  const uint worker = simd_group * 32 + simd_lane;
+  const uint workers = uint(Simdgroups) * 32;
+  constexpr uint QuantGroups = TileN / 64;
+  for (uint task = worker; task < uint(TileM) * QuantGroups; task += workers) {
+    const uint row = task / QuantGroups;
+    const uint localGroup = task % QuantGroups;
+    const uint origin = row * output_size + output_origin + localGroup * 64;
+    float sum = 0.0f;
+    for (uint index = 0; index < 64; ++index)
+      sum += float(output[origin + index]);
+    output_sums[(output_origin / 64 + localGroup) * TileM + row] = sum;
+  }
+}
+
+#define SPLASH_APPLE7_PREFILL_AFFINE(Name, TileN, Simdgroups)                 \
+kernel void Name(device bfloat *input [[buffer(0)]],                         \
+                 device uchar *weights [[buffer(1)]],                        \
+                 device bfloat *scales [[buffer(2)]],                        \
+                 device bfloat *biases [[buffer(3)]],                        \
+                 device bfloat *output [[buffer(4)]],                        \
+                 device const float *sums [[buffer(5)]],                     \
+                 constant Q4PrefillParams &params [[buffer(6)]],              \
+                 uint2 group [[threadgroup_position_in_grid]],               \
+                 uint simd_lane [[thread_index_in_simdgroup]],                \
+                 uint simd_group [[simdgroup_index_in_threadgroup]]) {        \
+  constexpr ushort TileM = 32;                                               \
+  const uint rowTile = group.x, outputTile = group.y;                        \
+  const ulong inputOffset = ulong(rowTile) * TileM * params.input_size;       \
+  const ulong outputOffset = ulong(rowTile) * TileM * params.output_size;     \
+  q4_apple7_prefill_tile<TileM, TileN, Simdgroups, false, false>(             \
+      input + inputOffset, weights, scales, biases, output + outputOffset,    \
+      output + outputOffset, params.output_size, params.input_size,           \
+      sums + ulong(rowTile) * TileM * (params.input_size / 64),               \
+      outputTile * TileN, simd_lane, simd_group);                             \
+}
+
+#define SPLASH_APPLE7_PREFILL_RESIDUAL(Name, TileN, Simdgroups)               \
+kernel void Name(device bfloat *input [[buffer(0)]],                         \
+                 device uchar *weights [[buffer(1)]],                        \
+                 device bfloat *scales [[buffer(2)]],                        \
+                 device bfloat *biases [[buffer(3)]],                        \
+                 device bfloat *residual [[buffer(4)]],                      \
+                 device bfloat *output [[buffer(5)]],                        \
+                 device const float *sums [[buffer(6)]],                     \
+                 constant Q4PrefillParams &params [[buffer(7)]],              \
+                 uint2 group [[threadgroup_position_in_grid]],               \
+                 uint simd_lane [[thread_index_in_simdgroup]],                \
+                 uint simd_group [[simdgroup_index_in_threadgroup]]) {        \
+  constexpr ushort TileM = 32;                                               \
+  const uint rowTile = group.x, outputTile = group.y;                        \
+  const ulong inputOffset = ulong(rowTile) * TileM * params.input_size;       \
+  const ulong outputOffset = ulong(rowTile) * TileM * params.output_size;     \
+  q4_apple7_prefill_tile<TileM, TileN, Simdgroups, true, false>(              \
+      input + inputOffset, weights, scales, biases, output + outputOffset,    \
+      residual + outputOffset, params.output_size, params.input_size,         \
+      sums + ulong(rowTile) * TileM * (params.input_size / 64),               \
+      outputTile * TileN, simd_lane, simd_group);                             \
+}
+
+SPLASH_APPLE7_PREFILL_AFFINE(prefill_linear_q4_n128, 128, 8)
+SPLASH_APPLE7_PREFILL_AFFINE(prefill_linear_q4_n256, 256, 8)
+SPLASH_APPLE7_PREFILL_RESIDUAL(prefill_linear_q4_n128_residual, 128, 8)
+SPLASH_APPLE7_PREFILL_RESIDUAL(prefill_linear_q4_n256_residual, 256, 8)
+SPLASH_APPLE7_PREFILL_AFFINE(prefill_linear_q4_n128_sg4, 128, 4)
+SPLASH_APPLE7_PREFILL_RESIDUAL(prefill_linear_q4_n128_residual_sg4, 128, 4)
+
+#define SPLASH_APPLE7_PREFILL_UP(Name, TileN, Simdgroups)                    \
+kernel void Name(device bfloat *input [[buffer(0)]],                         \
+                 device uchar *weights [[buffer(1)]],                        \
+                 device bfloat *scales [[buffer(2)]],                        \
+                 device bfloat *biases [[buffer(3)]],                        \
+                 device bfloat *gate [[buffer(4)]],                          \
+                 device bfloat *output [[buffer(5)]],                        \
+                 device const float *sums [[buffer(6)]],                     \
+                 device float *output_sums [[buffer(7)]],                    \
+                 constant Q4PrefillParams &params [[buffer(8)]],              \
+                 uint2 group [[threadgroup_position_in_grid]],               \
+                 uint simd_lane [[thread_index_in_simdgroup]],                \
+                 uint simd_group [[simdgroup_index_in_threadgroup]]) {        \
+  constexpr ushort TileM = 32;                                               \
+  const uint rowTile = group.x, outputTile = group.y;                        \
+  const ulong inputOffset = ulong(rowTile) * TileM * params.input_size;       \
+  const ulong outputOffset = ulong(rowTile) * TileM * params.output_size;     \
+  device const float *rowSums = sums + ulong(rowTile) * TileM *               \
+                                (params.input_size / 64);                    \
+  device bfloat *rowOutput = output + outputOffset;                          \
+  q4_apple7_prefill_tile<TileM, TileN, Simdgroups, false, true>(              \
+      input + inputOffset, weights, scales, biases, rowOutput,                \
+      gate + outputOffset, params.output_size, params.input_size, rowSums,    \
+      outputTile * TileN, simd_lane, simd_group);                             \
+  threadgroup_barrier(mem_flags::mem_device);                                \
+  q4_apple7_write_output_sums<TileM, TileN, Simdgroups>(                      \
+      rowOutput, output_sums + ulong(rowTile) * TileM *                       \
+          (params.output_size / 64), params.output_size,                    \
+      outputTile * TileN, simd_lane, simd_group);                             \
+}
+
+SPLASH_APPLE7_PREFILL_UP(prefill_linear_q4_n256_up_silu_sums, 256, 8)
+SPLASH_APPLE7_PREFILL_UP(prefill_linear_q4_n128_up_silu_sums_sg4, 128, 4)
+
+#undef SPLASH_APPLE7_PREFILL_AFFINE
+#undef SPLASH_APPLE7_PREFILL_RESIDUAL
+#undef SPLASH_APPLE7_PREFILL_UP
+#endif
