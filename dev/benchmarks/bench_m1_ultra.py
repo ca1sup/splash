@@ -15,7 +15,9 @@ import http.client
 import json
 import os
 import platform
+import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -45,6 +47,65 @@ def command_text(*command: str) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return result.stdout.strip() or None
+
+
+def process_rss_bytes(pid: int | None) -> int | None:
+    if pid is None:
+        return None
+    value = command_text("ps", "-o", "rss=", "-p", str(pid))
+    try:
+        return int(value) * 1024 if value else None
+    except ValueError:
+        return None
+
+
+def swap_used_bytes() -> int | None:
+    value = command_text("sysctl", "-n", "vm.swapusage")
+    if not value:
+        return None
+    match = re.search(r"used = ([0-9.]+)([KMGTP])", value)
+    if not match:
+        return None
+    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
+    return int(float(match.group(1)) * multipliers[match.group(2)])
+
+
+class MemorySampler:
+    def __init__(self, pid: int | None, interval_ms: int) -> None:
+        self.pid = pid
+        self.interval = max(10, interval_ms) / 1000.0
+        self.baseline_swap = swap_used_bytes()
+        self.peak_rss: int | None = None
+        self.latest_swap: int | None = self.baseline_swap
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def sample(self) -> None:
+        rss = process_rss_bytes(self.pid)
+        if rss is not None:
+            self.peak_rss = max(self.peak_rss or 0, rss)
+        self.latest_swap = swap_used_bytes()
+
+    def start(self) -> None:
+        if self.pid is None:
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            self.sample()
+
+    def stop(self) -> None:
+        if self.thread is not None:
+            self.stop_event.set()
+            self.thread.join(timeout=max(1.0, self.interval * 4))
+            self.sample()
+
+    def swap_delta(self) -> int | None:
+        if self.baseline_swap is None or self.latest_swap is None:
+            return None
+        return max(0, self.latest_swap - self.baseline_swap)
 
 
 def build_metadata(
@@ -256,6 +317,8 @@ def main() -> int:
     )
     parser.add_argument("--model-manifest", type=Path)
     parser.add_argument("--capability-probe", type=Path)
+    parser.add_argument("--server-pid", type=int)
+    parser.add_argument("--memory-sample-ms", type=int, default=50)
     parser.add_argument(
         "--contexts", type=parse_contexts, default=[512, 4096, 16384, 32768]
     )
@@ -280,6 +343,8 @@ def main() -> int:
     metadata = build_metadata(
         args.root, args.model, manifest_path, args.capability_probe
     )
+    memory = MemorySampler(args.server_pid, args.memory_sample_ms)
+    memory.start()
     sampling = {
         "temperature": 0,
         "reasoning_effort": args.reasoning_effort,
@@ -305,85 +370,92 @@ def main() -> int:
         "sampling_config_hash": sha256(sampling),
         "concurrency": 1,
     }
-    with args.output.open("a", encoding="utf-8") as output:
-        output.write(json.dumps({"record_type": "manifest", **run_manifest}) + "\n")
-        for warmup in range(args.warmup):
-            prompt = prompt_for(128, f"warmup-{args.corpus_seed}-{warmup}")
-            run_one(
-                args.url,
-                args.model,
-                prompt,
-                args.reasoning_effort,
-                min(32, args.output_tokens),
-            )
-        for scenario in scenarios:
-            for sample in range(args.samples):
-                for requested in args.contexts:
-                    nonce = f"{scenario}-{args.corpus_seed}-{sample}-{requested}"
-                    prompt = prompt_for(requested, nonce)
-                    if scenario == "append":
-                        prompt += "\nAppend-only suffix: compare the final two implementation choices."
-                    if scenario == "exact":
-                        run_one(
+    try:
+        with args.output.open("a", encoding="utf-8") as output:
+            output.write(json.dumps({"record_type": "manifest", **run_manifest}) + "\n")
+            for warmup in range(args.warmup):
+                prompt = prompt_for(128, f"warmup-{args.corpus_seed}-{warmup}")
+                run_one(
+                    args.url,
+                    args.model,
+                    prompt,
+                    args.reasoning_effort,
+                    min(32, args.output_tokens),
+                )
+            for scenario in scenarios:
+                for sample in range(args.samples):
+                    for requested in args.contexts:
+                        nonce = f"{scenario}-{args.corpus_seed}-{sample}-{requested}"
+                        prompt = prompt_for(requested, nonce)
+                        if scenario == "append":
+                            prompt += "\nAppend-only suffix: compare the final two implementation choices."
+                        if scenario == "exact":
+                            run_one(
+                                args.url,
+                                args.model,
+                                prompt,
+                                args.reasoning_effort,
+                                args.output_tokens,
+                            )
+                            measured_prompt = prompt
+                        elif scenario == "append":
+                            measured_prompt = (
+                                prompt
+                                + "\nNew suffix for the next turn: give one concise conclusion."
+                            )
+                        else:
+                            measured_prompt = prompt
+                        measured = run_one(
                             args.url,
                             args.model,
-                            prompt,
+                            measured_prompt,
                             args.reasoning_effort,
                             args.output_tokens,
                         )
-                        measured_prompt = prompt
-                    elif scenario == "append":
-                        measured_prompt = (
-                            prompt
-                            + "\nNew suffix for the next turn: give one concise conclusion."
+                        record = {
+                            "record_type": "measurement",
+                            "run_id": run_manifest["run_id"],
+                            "engine": "splash",
+                            **metadata,
+                            "scenario": scenario,
+                            "sample": sample,
+                            "requested_prompt_tokens": requested,
+                            "prompt_sha256": sha256(measured_prompt),
+                            "rendered_prompt_tokens": measured["prompt_tokens"],
+                            "cached_prompt_tokens": measured["cached_prompt_tokens"],
+                            "output_tokens_committed": measured[
+                                "output_tokens_committed"
+                            ],
+                            "prefill_seconds": measured["prefill_seconds"],
+                            "decode_seconds": measured["decode_seconds"],
+                            "http_ttft_seconds": measured["http_ttft_seconds"],
+                            "request_seconds": measured["request_seconds"],
+                            "reasoning_mode": args.reasoning_effort,
+                            "corpus_seed": args.corpus_seed,
+                            "sampling_config_hash": run_manifest[
+                                "sampling_config_hash"
+                            ],
+                            "cache_mode": scenario,
+                            "concurrency": 1,
+                            "cache": measured["cache"],
+                            "native_metrics": measured["native_metrics"],
+                            "native_delta": measured["native_delta"],
+                            "peak_process_bytes": memory.peak_rss,
+                            "peak_metal_bytes": None,
+                            "swap_delta_bytes": memory.swap_delta(),
+                            "correctness": "not-run",
+                            "exit_status": 0,
+                        }
+                        output.write(json.dumps(record, sort_keys=True) + "\n")
+                        output.flush()
+                        print(
+                            f"{scenario} sample={sample} requested={requested} actual="
+                            f"{record['rendered_prompt_tokens']} cache={record['cached_prompt_tokens']} "
+                            f"decode_tokens={record['output_tokens_committed']}",
+                            flush=True,
                         )
-                    else:
-                        measured_prompt = prompt
-                    measured = run_one(
-                        args.url,
-                        args.model,
-                        measured_prompt,
-                        args.reasoning_effort,
-                        args.output_tokens,
-                    )
-                    record = {
-                        "record_type": "measurement",
-                        "run_id": run_manifest["run_id"],
-                        "engine": "splash",
-                        **metadata,
-                        "scenario": scenario,
-                        "sample": sample,
-                        "requested_prompt_tokens": requested,
-                        "prompt_sha256": sha256(measured_prompt),
-                        "rendered_prompt_tokens": measured["prompt_tokens"],
-                        "cached_prompt_tokens": measured["cached_prompt_tokens"],
-                        "output_tokens_committed": measured["output_tokens_committed"],
-                        "prefill_seconds": measured["prefill_seconds"],
-                        "decode_seconds": measured["decode_seconds"],
-                        "http_ttft_seconds": measured["http_ttft_seconds"],
-                        "request_seconds": measured["request_seconds"],
-                        "reasoning_mode": args.reasoning_effort,
-                        "corpus_seed": args.corpus_seed,
-                        "sampling_config_hash": run_manifest["sampling_config_hash"],
-                        "cache_mode": scenario,
-                        "concurrency": 1,
-                        "cache": measured["cache"],
-                        "native_metrics": measured["native_metrics"],
-                        "native_delta": measured["native_delta"],
-                        "peak_process_bytes": None,
-                        "peak_metal_bytes": None,
-                        "swap_delta_bytes": None,
-                        "correctness": "not-run",
-                        "exit_status": 0,
-                    }
-                    output.write(json.dumps(record, sort_keys=True) + "\n")
-                    output.flush()
-                    print(
-                        f"{scenario} sample={sample} requested={requested} actual="
-                        f"{record['rendered_prompt_tokens']} cache={record['cached_prompt_tokens']} "
-                        f"decode_tokens={record['output_tokens_committed']}",
-                        flush=True,
-                    )
+    finally:
+        memory.stop()
     return 0
 
 
