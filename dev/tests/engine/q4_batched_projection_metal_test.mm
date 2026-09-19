@@ -3,7 +3,9 @@
 
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,66 @@ constexpr uint32_t kInput = 5120;
 constexpr uint32_t kOutput = 16640;
 constexpr uint32_t kGroups = 60;
 constexpr uint32_t kQuantGroup = 64;
+
+[[noreturn]] void fail(const std::string &message);
+
+uint32_t unpackNibble(const uint8_t *weights, uint32_t index) {
+  const uint8_t packed = weights[index / 2];
+  return (index & 1) ? packed >> 4 : packed & 0x0f;
+}
+
+uint32_t bfloatUlpDistance(uint16_t actual, uint16_t expected) {
+  if ((actual ^ expected) & 0x8000)
+    return UINT32_MAX;
+  return actual > expected ? actual - expected : expected - actual;
+}
+
+void checkNibbleBoundaries() {
+  std::array<uint8_t, 32> packed{};
+  for (uint32_t index = 0; index < 64; ++index)
+    packed[index / 2] = static_cast<uint8_t>(
+        (index & 1) ? (packed[index / 2] & 0x0f) | ((index % 16) << 4)
+                    : (packed[index / 2] & 0xf0) | (index % 16));
+  for (uint32_t index = 0; index < 64; ++index)
+    if (unpackNibble(packed.data(), index) != index % 16)
+      fail("Q4 nibble boundary unpack differs from handcrafted layout");
+}
+
+void scalarQ4Reference(const __bf16 *input, const uint8_t *weights,
+                       const __bf16 *scales, const __bf16 *biases,
+                       __bf16 *output, uint32_t rows, uint32_t outputSize,
+                       uint32_t inputSize) {
+  const uint32_t quantGroups = inputSize / kQuantGroup;
+  const uint32_t storageN = 256;
+  for (uint32_t row = 0; row < rows; ++row) {
+    for (uint32_t column = 0; column < outputSize; ++column) {
+      const uint32_t tile = column / storageN;
+      const uint32_t tileOffset = column % storageN;
+      float value = 0.0f;
+      for (uint32_t group = 0; group < quantGroups; ++group) {
+        float dot = 0.0f;
+        float sum = 0.0f;
+        for (uint32_t index = 0; index < kQuantGroup; ++index) {
+          const float inputValue = static_cast<float>(
+              input[row * inputSize + group * kQuantGroup + index]);
+          const uint32_t weightColumn =
+              tile * quantGroups * storageN + group * storageN + tileOffset;
+          dot = std::fmaf(
+              inputValue,
+              static_cast<float>(unpackNibble(weights + weightColumn * 32,
+                                              index)),
+              dot);
+          sum += inputValue;
+        }
+        const uint32_t parameter =
+            (tile * quantGroups + group) * storageN + tileOffset;
+        value = std::fmaf(dot, static_cast<float>(scales[parameter]),
+                          sum * static_cast<float>(biases[parameter])) + value;
+      }
+      output[row * outputSize + column] = __bf16(value);
+    }
+  }
+}
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -91,6 +153,7 @@ ComputeDispatch upSilu(std::string pipeline, MetalBuffer input,
 }
 
 void run(const std::string &metallibPath) {
+  checkNibbleBoundaries();
   MetalBackend backend(metallibPath);
   const uint64_t inputElements = uint64_t{kRows} * kInput;
   const uint64_t outputElements = uint64_t{kRows} * kOutput;
@@ -143,6 +206,67 @@ void run(const std::string &metallibPath) {
         params));
   }
   (void)backend.submitCommand(singles);
+
+  std::vector<__bf16> scalarReference(kMaximumBatch * outputElements);
+  scalarQ4Reference(inputValuesPtr, weight, scale, bias, scalarReference.data(),
+                    kMaximumBatch * kRows, kOutput, kInput);
+  const auto *actual = static_cast<const __bf16 *>(reference.contents());
+  uint64_t mismatches = 0;
+  uint32_t maxUlp = 0;
+  float maxAbsoluteError = 0.0f;
+  double sumAbsoluteError = 0.0;
+  size_t firstMismatch = scalarReference.size();
+  uint16_t firstActualBits = 0;
+  uint16_t firstExpectedBits = 0;
+  for (size_t index = 0; index < scalarReference.size(); ++index) {
+    if (actual[index] == scalarReference[index])
+      continue;
+    ++mismatches;
+    uint16_t actualBits = 0;
+    uint16_t expectedBits = 0;
+    std::memcpy(&actualBits, actual + index, sizeof(actualBits));
+    std::memcpy(&expectedBits, scalarReference.data() + index,
+                sizeof(expectedBits));
+    maxUlp = std::max(maxUlp, bfloatUlpDistance(actualBits, expectedBits));
+    const float actualValue = static_cast<float>(actual[index]);
+    const float expectedValue = static_cast<float>(scalarReference[index]);
+    if (!std::isfinite(actualValue) || !std::isfinite(expectedValue))
+      fail("Apple7 Q4 projection produced a non-finite scalar-reference value");
+    const float absoluteError = std::fabs(actualValue - expectedValue);
+    maxAbsoluteError = std::max(maxAbsoluteError, absoluteError);
+    sumAbsoluteError += absoluteError;
+    if (firstMismatch == scalarReference.size()) {
+      firstMismatch = index;
+      firstActualBits = actualBits;
+      firstExpectedBits = expectedBits;
+    }
+  }
+  // The Metal compiler may fuse FP32 arithmetic differently from the host
+  // scalar reference before the final BF16 conversion. Keep the independent
+  // oracle strict in value space while allowing that documented rounding
+  // difference; layout or nibble errors are orders of magnitude larger.
+  const double meanAbsoluteError =
+      sumAbsoluteError / static_cast<double>(scalarReference.size());
+  if (maxAbsoluteError > 0.125f || !std::isfinite(maxAbsoluteError)) {
+    std::cerr << "Q4 first mismatch index=" << firstMismatch
+              << " actual_bits=0x" << std::hex << firstActualBits
+              << " expected_bits=0x" << firstExpectedBits << std::dec
+              << " actual=" << static_cast<float>(actual[firstMismatch])
+              << " expected="
+              << static_cast<float>(scalarReference[firstMismatch])
+              << " mismatches=" << mismatches << " max_ulp=" << maxUlp
+              << " max_abs=" << maxAbsoluteError
+              << " mean_abs=" << meanAbsoluteError << '\n';
+    fail("Apple7 Q4 projection differs from the independent scalar reference");
+  }
+  if (mismatches) {
+    std::cout << "PASS q4 scalar reference max_abs=" << maxAbsoluteError
+              << " mean_abs=" << meanAbsoluteError
+              << " mismatches=" << mismatches << " max_ulp=" << maxUlp
+              << '\n';
+  } else {
+    std::cout << "PASS q4 scalar reference exact=true\n";
+  }
 
   // The pipelined narrow-projection kernel issues two quant groups before
   // either epilogue; its outputs must be byte-identical to the sequential M8.
