@@ -269,6 +269,25 @@ def body(model: str, prompt: str, output_tokens: int, reasoning: str) -> dict:
     }
 
 
+def scenario_warmup_and_measurement(
+    scenario: str, prompt: str
+) -> tuple[str | None, str]:
+    """Return the optional cache-warm prompt and the measured prompt.
+
+    Exact-prefix and append measurements must first establish the prefix in
+    the same process/cache namespace. The warmup request is intentionally
+    separate from the measured request so its time is not included.
+    """
+    if scenario == "exact":
+        return prompt, prompt
+    if scenario == "append":
+        return (
+            prompt,
+            prompt + "\nNew suffix for the next turn: give one concise conclusion.",
+        )
+    return None, prompt
+
+
 def run_one(base: str, model: str, prompt: str, reasoning: str, output_tokens: int):
     before, _ = request(base, "GET", "/status")
     result, wall, first_content, streamed_tokens = stream_request(
@@ -393,22 +412,17 @@ def main() -> int:
                         prompt = prompt_for(requested, nonce)
                         if scenario == "append":
                             prompt += "\nAppend-only suffix: compare the final two implementation choices."
-                        if scenario == "exact":
+                        warmup_prompt, measured_prompt = (
+                            scenario_warmup_and_measurement(scenario, prompt)
+                        )
+                        if warmup_prompt is not None:
                             run_one(
                                 args.url,
                                 args.model,
-                                prompt,
+                                warmup_prompt,
                                 args.reasoning_effort,
                                 args.output_tokens,
                             )
-                            measured_prompt = prompt
-                        elif scenario == "append":
-                            measured_prompt = (
-                                prompt
-                                + "\nNew suffix for the next turn: give one concise conclusion."
-                            )
-                        else:
-                            measured_prompt = prompt
                         measured = run_one(
                             args.url,
                             args.model,

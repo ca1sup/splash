@@ -36,6 +36,19 @@ class M1UltraBenchmarkTests(unittest.TestCase):
             bench.prompt_for(512, "uncached-other-0-512"),
         )
 
+    def test_append_measurement_warms_the_exact_prefix(self):
+        prompt = bench.prompt_for(512, "append-seed-0-512")
+        warmup, measured = bench.scenario_warmup_and_measurement("append", prompt)
+        self.assertEqual(warmup, prompt)
+        self.assertTrue(measured.startswith(prompt))
+        self.assertNotEqual(warmup, measured)
+
+    def test_uncached_measurement_has_no_warmup(self):
+        prompt = bench.prompt_for(512, "uncached-seed-0-512")
+        warmup, measured = bench.scenario_warmup_and_measurement("uncached", prompt)
+        self.assertIsNone(warmup)
+        self.assertEqual(measured, prompt)
+
     def test_paired_ratio_is_candidate_over_reference(self):
         manifest = {
             "model": "model",
