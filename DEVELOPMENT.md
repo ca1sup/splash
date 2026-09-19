@@ -166,10 +166,13 @@ python3 dev/benchmarks/summarize_m1_ultra.py \
   /path/to/experiments/splash-m1-ultra.jsonl
 ```
 
-The `uncached`, `exact`, and `append` scenarios are reported separately. A
-prefix hit is not presented as ordinary native prefill: cached prompt tokens
-and newly evaluated tokens remain distinct. Use the same corpus seed and
-settings for a paired candidate, then compare it explicitly:
+The `uncached`, `exact`, and `append` scenarios are reported separately. The
+`exact` and `append` cases first issue an unmeasured warmup request in the same
+cache namespace; append therefore measures a base prefix followed by a new
+suffix, not merely a longer first request. A prefix hit is not presented as
+ordinary native prefill: cached prompt tokens and newly evaluated tokens remain
+distinct. Use the same corpus seed and settings for a paired candidate, then
+compare it explicitly:
 
 ```sh
 python3 dev/benchmarks/summarize_m1_ultra.py \
