@@ -159,6 +159,8 @@ python3 dev/benchmarks/bench_m1_ultra.py \
   --url http://127.0.0.1:18000 \
   --model incoai/Qwen3.8-27B-Splash \
   --corpus-seed splash-m1-ultra-corpus-v1 \
+  --capability-probe /path/to/experiments/splash-m1-ultra/capability-probe.json \
+  --server-pid "$SPLASH_PID" \
   --output /path/to/experiments/splash-m1-ultra.jsonl
 python3 dev/benchmarks/summarize_m1_ultra.py \
   /path/to/experiments/splash-m1-ultra.jsonl
