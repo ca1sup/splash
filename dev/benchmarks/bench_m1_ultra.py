@@ -14,6 +14,8 @@ import hashlib
 import http.client
 import json
 import os
+import platform
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +27,45 @@ def sha256(value: object) -> str:
     else:
         data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(data).hexdigest()
+
+
+def file_sha256(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def command_text(*command: str) -> str | None:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def build_metadata(root: Path, model: str, manifest: Path | None, probe: Path | None) -> dict:
+    capability = {}
+    if probe is not None and probe.is_file():
+        try:
+            capability = json.loads(probe.read_text())
+        except (OSError, json.JSONDecodeError):
+            capability = {}
+    device = capability.get("device_name")
+    cores = capability.get("gpu_core_count")
+    hardware = f"{device} {cores}-core" if device and cores else platform.machine()
+    return {
+        "source_commit": command_text("git", "-C", str(root), "rev-parse", "HEAD"),
+        "binary_sha256": file_sha256(root / "build/splash"),
+        "metallib_sha256": file_sha256(root / "build/splash.metallib"),
+        "hardware_profile": hardware,
+        "os_build": command_text("sw_vers", "-buildVersion"),
+        "toolchain": command_text("xcodebuild", "-version"),
+        "model_manifest_sha256": file_sha256(manifest),
+    }
 
 
 def parse_contexts(value: str) -> list[int]:
@@ -183,6 +224,14 @@ def main() -> int:
     parser.add_argument("--url", default=os.environ.get("SPLASH_BENCH_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parents[2],
+        help="Splash checkout used for source and artifact identity",
+    )
+    parser.add_argument("--model-manifest", type=Path)
+    parser.add_argument("--capability-probe", type=Path)
     parser.add_argument("--contexts", type=parse_contexts, default=[512, 4096, 16384, 32768])
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
@@ -194,6 +243,15 @@ def main() -> int:
         parser.error("samples/output-tokens must be positive and warmup must be nonnegative")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.model_manifest
+    if manifest_path is None:
+        manifest_path = args.root / "install/models" / args.model / "manifest.json"
+    metadata = build_metadata(args.root, args.model, manifest_path, args.capability_probe)
+    sampling = {
+        "temperature": 0,
+        "reasoning_effort": args.reasoning_effort,
+        "stream": True,
+    }
     scenarios = ("uncached", "exact", "append") if args.scenario == "all" else (args.scenario,)
     run_manifest = {
         "runner": "bench_m1_ultra.py",
@@ -207,6 +265,9 @@ def main() -> int:
         "reasoning_effort": args.reasoning_effort,
         "scenarios": scenarios,
         "clock": "time.monotonic",
+        **metadata,
+        "sampling_config_hash": sha256(sampling),
+        "concurrency": 1,
     }
     with args.output.open("a", encoding="utf-8") as output:
         output.write(json.dumps({"record_type": "manifest", **run_manifest}) + "\n")
@@ -238,6 +299,7 @@ def main() -> int:
                         "record_type": "measurement",
                         "run_id": run_manifest["run_id"],
                         "engine": "splash",
+                        **metadata,
                         "scenario": scenario,
                         "sample": sample,
                         "requested_prompt_tokens": requested,
@@ -249,6 +311,10 @@ def main() -> int:
                         "decode_seconds": measured["decode_seconds"],
                         "http_ttft_seconds": measured["http_ttft_seconds"],
                         "request_seconds": measured["request_seconds"],
+                        "reasoning_mode": args.reasoning_effort,
+                        "sampling_config_hash": run_manifest["sampling_config_hash"],
+                        "cache_mode": scenario,
+                        "concurrency": 1,
                         "cache": measured["cache"],
                         "native_metrics": measured["native_metrics"],
                         "native_delta": measured["native_delta"],
