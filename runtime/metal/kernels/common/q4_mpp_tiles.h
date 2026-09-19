@@ -15,17 +15,52 @@ inline uint q4_apple7_nibble(device const uchar *column, uint index) {
   return (index & 1) ? uint(packed >> 4) : uint(packed & 0x0f);
 }
 
+// The Apple7 reference path originally loaded one byte and decoded one nibble
+// for every multiply.  The package layout is aligned to 32-byte weight
+// columns, so it is safe to consume each 64-value group as sixteen aligned
+// uint words.  This keeps the exact low/high-nibble ordering while reducing
+// the load/decode overhead that otherwise dominates this fallback on M1.
+inline void q4_apple7_accumulate_word(device const bfloat *input,
+                                      uint input_origin,
+                                      device const uint *packed,
+                                      uint word_index, thread float &dot,
+                                      thread float &sum) {
+  const uint word = packed[word_index];
+  const uint input_index = input_origin + word_index * 8;
+#pragma unroll
+  for (uint nibble = 0; nibble < 8; ++nibble) {
+    const float value = float(input[input_index + nibble]);
+    dot = fma(value, float((word >> (nibble * 4)) & 0x0fu), dot);
+    sum += value;
+  }
+}
+
+inline void q4_apple7_accumulate_staged_word(threadgroup const bfloat *input,
+                                             uint input_origin,
+                                             device const uint *packed,
+                                             uint word_index,
+                                             thread float &dot,
+                                             thread float &sum) {
+  const uint word = packed[word_index];
+  const uint input_index = input_origin + word_index * 8;
+#pragma unroll
+  for (uint nibble = 0; nibble < 8; ++nibble) {
+    const float value = float(input[input_index + nibble]);
+    dot = fma(value, float((word >> (nibble * 4)) & 0x0fu), dot);
+    sum += value;
+  }
+}
+
 inline float q4_apple7_value(device const bfloat *input, uint input_origin,
                              device const uchar *weights, uint weight_origin,
                              device const bfloat *scale,
                              device const bfloat *bias, uint parameter) {
   float dot = 0.0f;
   float sum = 0.0f;
-  for (uint index = 0; index < 64; ++index) {
-    const float value = float(input[input_origin + index]);
-    dot += value * float(q4_apple7_nibble(weights + weight_origin, index));
-    sum += value;
-  }
+  device const uint *packed = (device const uint *)(weights + weight_origin);
+#pragma unroll
+  for (uint word = 0; word < 8; ++word)
+    q4_apple7_accumulate_word(input, input_origin, packed, word, dot, sum);
   return dot * float(scale[parameter]) + sum * float(bias[parameter]);
 }
 
@@ -38,11 +73,11 @@ inline float q4_apple7_staged_value(threadgroup const bfloat *input,
                                     uint parameter) {
   float dot = 0.0f;
   float sum = 0.0f;
-  for (uint index = 0; index < 64; ++index) {
-    const float value = float(input[input_origin + index]);
-    dot += value * float(q4_apple7_nibble(weights + weight_origin, index));
-    sum += value;
-  }
+  device const uint *packed = (device const uint *)(weights + weight_origin);
+#pragma unroll
+  for (uint word = 0; word < 8; ++word)
+    q4_apple7_accumulate_staged_word(input, input_origin, packed, word, dot,
+                                     sum);
   return dot * float(scale[parameter]) + sum * float(bias[parameter]);
 }
 
