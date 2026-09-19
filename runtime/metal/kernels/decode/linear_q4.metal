@@ -1,6 +1,14 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 
+#if SPLASH_APPLE7
+#define Q4_STAGE_DECL threadgroup bfloat q4_staged_input[32 * 64];
+#define Q4_STAGE_ARGUMENT , q4_staged_input
+#else
+#define Q4_STAGE_DECL
+#define Q4_STAGE_ARGUMENT
+#endif
+
 // Decode projections: persistent threadgroups stride over TileN-wide output
 // tiles, TileCall names the q4_mpp_tiles.h instantiation and Sums holds eight
 // input sums per row. The auxiliary buffer is the residual the epilogue adds
@@ -16,11 +24,13 @@
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     threadgroup float input_sums[Sums];                                        \
+    Q4_STAGE_DECL                                                               \
     uint tiles = params.output_size / TileN;                                   \
     for (uint tile = group; tile < tiles; tile += params.persistent_groups) {  \
       TileCall(input, weights, scales, biases, output, weights, scales,        \
                biases, output, params.output_size, params.input_size,          \
-               input_sums, tile * TileN, simd_lane, simd_group);               \
+               input_sums, tile * TileN, simd_lane, simd_group                 \
+                   Q4_STAGE_ARGUMENT);                                        \
     }                                                                          \
   }
 
@@ -36,11 +46,13 @@
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     threadgroup float input_sums[Sums];                                        \
+    Q4_STAGE_DECL                                                               \
     uint tiles = params.output_size / TileN;                                   \
     for (uint tile = group; tile < tiles; tile += params.persistent_groups) {  \
       TileCall(input, weights, scales, biases, output, weights, scales,        \
                biases, Auxiliary, params.output_size, params.input_size,       \
-               input_sums, tile * TileN, simd_lane, simd_group);               \
+               input_sums, tile * TileN, simd_lane, simd_group                 \
+                   Q4_STAGE_ARGUMENT);                                        \
     }                                                                          \
   }
 
@@ -58,12 +70,13 @@
                    uint simd_lane [[thread_index_in_simdgroup]],               \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {       \
     threadgroup float input_sums[Sums];                                        \
+    Q4_STAGE_DECL                                                               \
     uint tiles = params.output_size / TileN;                                   \
     for (uint tile = group; tile < tiles; tile += params.persistent_groups) {  \
       TileCall(input, weights_0, scales_0, biases_0, output, weights_1,        \
                scales_1, biases_1, output, params.output_size,                 \
                params.input_size, input_sums, tile * TileN, simd_lane,         \
-               simd_group);                                                    \
+               simd_group Q4_STAGE_ARGUMENT);                                  \
     }                                                                          \
   }
 
@@ -110,3 +123,5 @@ Q4_DECODE_AUXILIARY(decode_linear_q4_n256_up_silu_m24, gate,
 #undef Q4_DECODE_AFFINE
 #undef Q4_DECODE_AUXILIARY
 #undef Q4_DECODE_GATE_UP
+#undef Q4_STAGE_DECL
+#undef Q4_STAGE_ARGUMENT

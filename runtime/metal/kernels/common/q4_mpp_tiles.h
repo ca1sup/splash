@@ -29,6 +29,23 @@ inline float q4_apple7_value(device const bfloat *input, uint input_origin,
   return dot * float(scale[parameter]) + sum * float(bias[parameter]);
 }
 
+inline float q4_apple7_staged_value(threadgroup const bfloat *input,
+                                    uint input_origin,
+                                    device const uchar *weights,
+                                    uint weight_origin,
+                                    device const bfloat *scale,
+                                    device const bfloat *bias,
+                                    uint parameter) {
+  float dot = 0.0f;
+  float sum = 0.0f;
+  for (uint index = 0; index < 64; ++index) {
+    const float value = float(input[input_origin + index]);
+    dot += value * float(q4_apple7_nibble(weights + weight_origin, index));
+    sum += value;
+  }
+  return dot * float(scale[parameter]) + sum * float(bias[parameter]);
+}
+
 template <ushort TileN, bool GateUp, bool AddResidual,
           ushort StorageN = TileN, bool Pipelined = false>
 inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
@@ -37,32 +54,70 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
                         device bfloat *scales_1, device bfloat *biases_1,
                         device bfloat *residual, uint output_size,
                         uint input_size, threadgroup float *,
-                        uint output_origin, uint simd_lane, uint simd_group) {
+                        uint output_origin, uint simd_lane, uint simd_group
+#if SPLASH_APPLE7
+                        , threadgroup bfloat *staged_input = nullptr
+#endif
+                        ) {
   constexpr uint Rows = 8;
   constexpr uint Workers = 8 * 32;
   const uint worker = simd_group * 32 + simd_lane;
   const uint quant_groups = input_size / 64;
   const uint tile = output_origin / StorageN;
   const uint tile_offset = output_origin % StorageN;
-  for (uint task = worker; task < Rows * TileN; task += Workers) {
-    const uint row = task / TileN;
-    const uint column = task % TileN;
-    float value0 = 0.0f;
-    float value1 = 0.0f;
-    for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+  constexpr uint Tasks = (Rows * TileN + Workers - 1) / Workers;
+  float values0[Tasks];
+  float values1[Tasks];
+  for (uint task_index = 0; task_index < Tasks; ++task_index) {
+    values0[task_index] = 0.0f;
+    values1[task_index] = 0.0f;
+  }
+  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+    if (staged_input) {
+      for (uint index = worker; index < Rows * 64; index += Workers) {
+        const uint row_index = index / 64;
+        const uint element = index % 64;
+        staged_input[index] =
+            input[row_index * input_size + quant_group * 64 + element];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint task_index = 0; task_index < Tasks; ++task_index) {
+      const uint task = worker + task_index * Workers;
+      if (task >= Rows * TileN) continue;
+      const uint row = task / TileN;
+      const uint column = task % TileN;
       const uint parameter = (tile * quant_groups + quant_group) * StorageN +
                              tile_offset + column;
       const uint weightColumn =
           tile * quant_groups * StorageN + quant_group * StorageN +
           tile_offset + column;
       const uint weightOrigin = weightColumn * 32;
+      const uint stagedOrigin = row * 64;
       const uint inputOrigin = row * input_size + quant_group * 64;
-      value0 += q4_apple7_value(input, inputOrigin, weights_0, weightOrigin,
-                                scales_0, biases_0, parameter);
-      if constexpr (GateUp)
-        value1 += q4_apple7_value(input, inputOrigin, weights_1, weightOrigin,
-                                  scales_1, biases_1, parameter);
+      values0[task_index] += staged_input
+          ? q4_apple7_staged_value(staged_input, stagedOrigin, weights_0,
+                                   weightOrigin, scales_0, biases_0, parameter)
+          : q4_apple7_value(input, inputOrigin, weights_0, weightOrigin,
+                            scales_0, biases_0, parameter);
+      if constexpr (GateUp) {
+        values1[task_index] += staged_input
+            ? q4_apple7_staged_value(staged_input, stagedOrigin, weights_1,
+                                     weightOrigin, scales_1, biases_1, parameter)
+            : q4_apple7_value(input, inputOrigin, weights_1, weightOrigin,
+                              scales_1, biases_1, parameter);
+      }
     }
+    if (staged_input)
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint task_index = 0; task_index < Tasks; ++task_index) {
+    const uint task = worker + task_index * Workers;
+    if (task >= Rows * TileN) continue;
+    const uint row = task / TileN;
+    const uint column = task % TileN;
+    const float value0 = values0[task_index];
+    const float value1 = values1[task_index];
     float result;
     if constexpr (GateUp) {
       const float gate = float(bfloat(value0));
@@ -86,31 +141,69 @@ inline void q4_mpp_tile_batched(
     device bfloat *biases_0, device bfloat *output_0, device uchar *weights_1,
     device bfloat *scales_1, device bfloat *biases_1, device bfloat *residual,
     uint output_size, uint input_size, threadgroup float *,
-    uint output_origin, uint simd_lane, uint simd_group) {
+    uint output_origin, uint simd_lane, uint simd_group
+#if SPLASH_APPLE7
+    , threadgroup bfloat *staged_input = nullptr
+#endif
+    ) {
+  constexpr uint Workers = uint(Simdgroups) * 32;
   const uint worker = simd_group * 32 + simd_lane;
-  const uint workers = uint(Simdgroups) * 32;
   const uint quant_groups = input_size / 64;
   const uint tile = output_origin / StorageN;
   const uint tile_offset = output_origin % StorageN;
-  for (uint task = worker; task < Rows * TileN; task += workers) {
-    const uint row = task / TileN;
-    const uint column = task % TileN;
-    float value0 = 0.0f;
-    float value1 = 0.0f;
-    for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+  constexpr uint Tasks = (Rows * TileN + Workers - 1) / Workers;
+  float values0[Tasks];
+  float values1[Tasks];
+  for (uint task_index = 0; task_index < Tasks; ++task_index) {
+    values0[task_index] = 0.0f;
+    values1[task_index] = 0.0f;
+  }
+  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
+    if (staged_input) {
+      for (uint index = worker; index < Rows * 64; index += Workers) {
+        const uint row_index = index / 64;
+        const uint element = index % 64;
+        staged_input[index] =
+            input[row_index * input_size + quant_group * 64 + element];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint task_index = 0; task_index < Tasks; ++task_index) {
+      const uint task = worker + task_index * Workers;
+      if (task >= Rows * TileN) continue;
+      const uint row = task / TileN;
+      const uint column = task % TileN;
       const uint parameter = (tile * quant_groups + quant_group) * StorageN +
                              tile_offset + column;
       const uint weightColumn =
           tile * quant_groups * StorageN + quant_group * StorageN +
           tile_offset + column;
       const uint weightOrigin = weightColumn * 32;
+      const uint stagedOrigin = row * 64;
       const uint inputOrigin = row * input_size + quant_group * 64;
-      value0 += q4_apple7_value(input, inputOrigin, weights_0, weightOrigin,
-                                scales_0, biases_0, parameter);
-      if constexpr (GateUp)
-        value1 += q4_apple7_value(input, inputOrigin, weights_1, weightOrigin,
-                                  scales_1, biases_1, parameter);
+      values0[task_index] += staged_input
+          ? q4_apple7_staged_value(staged_input, stagedOrigin, weights_0,
+                                   weightOrigin, scales_0, biases_0, parameter)
+          : q4_apple7_value(input, inputOrigin, weights_0, weightOrigin,
+                            scales_0, biases_0, parameter);
+      if constexpr (GateUp) {
+        values1[task_index] += staged_input
+            ? q4_apple7_staged_value(staged_input, stagedOrigin, weights_1,
+                                     weightOrigin, scales_1, biases_1, parameter)
+            : q4_apple7_value(input, inputOrigin, weights_1, weightOrigin,
+                              scales_1, biases_1, parameter);
+      }
     }
+    if (staged_input)
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint task_index = 0; task_index < Tasks; ++task_index) {
+    const uint task = worker + task_index * Workers;
+    if (task >= Rows * TileN) continue;
+    const uint row = task / TileN;
+    const uint column = task % TileN;
+    const float value0 = values0[task_index];
+    const float value1 = values1[task_index];
     float result;
     const uint outputIndex = row * output_size + output_origin + column;
     if constexpr (GateUp) {
