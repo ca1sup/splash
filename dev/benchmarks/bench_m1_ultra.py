@@ -206,7 +206,11 @@ def stream_request(
             raise BenchError(
                 f"stream returned HTTP {response.status}: {response.read()[:400]!r}"
             )
-        for raw_line in response.read().splitlines():
+        while True:
+            raw_line = response.readline()
+            if not raw_line:
+                break
+            raw_line = raw_line.rstrip(b"\r\n")
             if not raw_line.startswith(b"data: "):
                 continue
             event = raw_line[6:]

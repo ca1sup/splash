@@ -1,4 +1,8 @@
+import json
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from dev.benchmarks import bench_m1_ultra as bench
 from dev.benchmarks import summarize_m1_ultra as summary
@@ -61,6 +65,45 @@ class M1UltraBenchmarkTests(unittest.TestCase):
         candidate = {"corpus_seed": "two"}
         with self.assertRaisesRegex(ValueError, "corpus_seed"):
             summary.validate_comparable(reference, candidate)
+
+    def test_stream_measurement_records_first_content_before_completion(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers["Content-Length"])
+                json.loads(self.rfile.read(length))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(
+                    b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.02)
+                self.wfile.write(
+                    b'data: {"choices":[{"delta":{"content":"second"}}],'
+                    b'"usage":{"completion_tokens":2},"metrics":{}}\n\n'
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result, wall, ttft, tokens = bench.stream_request(
+                f"http://127.0.0.1:{server.server_port}", {}
+            )
+        finally:
+            server.shutdown()
+            thread.join(timeout=1)
+            server.server_close()
+        self.assertEqual(result["usage"]["completion_tokens"], 2)
+        self.assertEqual(tokens, 2)
+        self.assertIsNotNone(ttft)
+        self.assertLess(ttft, wall - 0.005)
 
 
 if __name__ == "__main__":
