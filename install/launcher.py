@@ -63,9 +63,14 @@ def _running_status():
 
 def _ensure_installed(model_id):
     if not paths.PACKAGED:
+        build_target = (
+            "m1-ultra"
+            if os.environ.get("SPLASH_APPLE7") in {"1", "true", "yes"}
+            else "all"
+        )
         for command in (
             ["make", "platform-check", "install-environment"],
-            ["make", "-j4", "all"],
+            ["make", "-j4", build_target],
         ):
             if subprocess.run(command, cwd=ROOT).returncode:
                 raise LauncherError("source build failed; see the output above")
@@ -105,6 +110,9 @@ def _serve_lock_owner(lock):
 
 
 def serve(args):
+    global PORT, BASE_URL
+    PORT = args.port
+    BASE_URL = f"http://127.0.0.1:{PORT}"
     # Keep this descriptor across exec: the foreground server owns the lock
     # until it exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -150,6 +158,8 @@ def serve(args):
             "auto" if args.max_memory is None else str(args.max_memory),
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
+            "--port",
+            str(PORT),
         ]
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
@@ -254,6 +264,16 @@ def _parse_max_context(value):
     return result
 
 
+def _parse_port(value):
+    try:
+        result = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("use a TCP port number") from None
+    if not 1 <= result <= 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return result
+
+
 def _version():
     if not paths.PACKAGED:
         return "Splash (source checkout)"
@@ -292,6 +312,12 @@ def parse_args(argv=None):
         "--max-context",
         type=_parse_max_context,
         help="context limit, e.g. 100K (default: auto)",
+    )
+    server.add_argument(
+        "--port",
+        type=_parse_port,
+        default=_parse_port(os.environ.get("SPLASH_PORT", "8000")),
+        help="loopback TCP port (default: SPLASH_PORT or 8000)",
     )
     server.add_argument(
         "--allowed-host",

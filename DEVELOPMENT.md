@@ -3,6 +3,11 @@
 Use Apple Silicon with macOS 26.4+, Xcode 26 or newer with Metal tools, and
 Python 3.12–3.14. Packaged users need none of these development tools.
 
+This fork has an experimental Apple7 preset for the 64-core M1 Ultra. The
+upstream build remains the default; the M1 preset is explicit because Metal
+must compile out newer packed-tensor specializations rather than select them
+after compilation.
+
 ## Build and run
 
 ```sh
@@ -11,6 +16,20 @@ cd splash
 make -j4
 ./splash serve --model incoai/Qwen3.8-27B-Splash
 ```
+
+On the M1 Ultra checkout, use the measured Apple7 build and keep experimental
+HTTP traffic separate from another local service:
+
+```sh
+make m1-ultra
+make m1-ultra-smoke
+SPLASH_APPLE7=1 SPLASH_PORT=18000 ./splash serve \
+  --model incoai/Qwen3.8-27B-Splash --no-webui
+```
+
+`SPLASH_PORT` is optional and defaults to 8000. `SPLASH_APPLE7=1` makes the
+source launcher rebuild the Apple7 preset when needed; it does not change the
+user's other services.
 
 `--model` requires a full Hugging Face `owner/repo` containing a Splash package.
 The first serve sets up Python dependencies, resolves a repository commit and
@@ -129,6 +148,24 @@ real HTTP/client behavior and performance checks.
 Compare performance on the same idle Mac with the same model and workload.
 `make tune-kernels MODEL=...` measures kernel policies. Keep generated reports,
 profiles, local paths and experiment notes out of the source tree and commits.
+
+The M1 benchmark runner records deterministic synthetic prompts, actual
+post-template token counts, cache state, native phase counters, HTTP TTFT, and
+JSONL measurements. Run it against the isolated port and summarize the same
+file:
+
+```sh
+python3 dev/benchmarks/bench_m1_ultra.py \
+  --url http://127.0.0.1:18000 \
+  --model incoai/Qwen3.8-27B-Splash \
+  --output /path/to/experiments/splash-m1-ultra.jsonl
+python3 dev/benchmarks/summarize_m1_ultra.py \
+  /path/to/experiments/splash-m1-ultra.jsonl
+```
+
+The `uncached`, `exact`, and `append` scenarios are reported separately. A
+prefix hit is not presented as ordinary native prefill: cached prompt tokens
+and newly evaluated tokens remain distinct.
 
 ## Package
 

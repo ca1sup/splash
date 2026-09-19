@@ -62,9 +62,13 @@ $(DEV_STAMP): dev/requirements.txt | install-environment
 # Build production and run native tests that do not require model weights.
 check-native-engine: check-native-cpu check-native-metal
 
-check-native-cpu: platform-check $(TARGET) test-engine-cpu
+# Keep the upstream/default build untouched, but make the experimental preset
+# explicit and usable for the native gates on Apple7 hardware.
+NATIVE_PRODUCTION_TARGET := $(if $(filter 1 true yes,$(SPLASH_APPLE7)),m1-ultra,$(TARGET))
 
-check-native-metal: platform-check $(TARGET) test-engine-metal
+check-native-cpu: platform-check $(NATIVE_PRODUCTION_TARGET) test-engine-cpu
+
+check-native-metal: platform-check $(NATIVE_PRODUCTION_TARGET) test-engine-metal
 
 # Discovering dev/tests/engine keeps this gate complete as new current runtime Python tests are
 # added.  dev/tests/test_models.py validates the installer and model manifests
