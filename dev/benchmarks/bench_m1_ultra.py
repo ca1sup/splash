@@ -47,7 +47,9 @@ def command_text(*command: str) -> str | None:
     return result.stdout.strip() or None
 
 
-def build_metadata(root: Path, model: str, manifest: Path | None, probe: Path | None) -> dict:
+def build_metadata(
+    root: Path, model: str, manifest: Path | None, probe: Path | None
+) -> dict:
     capability = {}
     if probe is not None and probe.is_file():
         try:
@@ -72,7 +74,9 @@ def parse_contexts(value: str) -> list[int]:
     try:
         result = [int(part) for part in value.split(",")]
     except ValueError:
-        raise argparse.ArgumentTypeError("contexts must be comma-separated integers") from None
+        raise argparse.ArgumentTypeError(
+            "contexts must be comma-separated integers"
+        ) from None
     if not result or any(context <= 0 for context in result):
         raise argparse.ArgumentTypeError("contexts must be positive")
     return result
@@ -82,7 +86,9 @@ class BenchError(RuntimeError):
     pass
 
 
-def request(base: str, method: str, path: str, body: dict | None = None, timeout: float = 1800.0):
+def request(
+    base: str, method: str, path: str, body: dict | None = None, timeout: float = 1800.0
+):
     host = base.removeprefix("http://").removeprefix("https://").rstrip("/")
     if "/" in host:
         host = host.split("/", 1)[0]
@@ -104,13 +110,19 @@ def request(base: str, method: str, path: str, body: dict | None = None, timeout
     try:
         document = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise BenchError(f"{method} {path} returned invalid JSON: {raw[:200]!r}") from error
+        raise BenchError(
+            f"{method} {path} returned invalid JSON: {raw[:200]!r}"
+        ) from error
     if response.status != 200:
-        raise BenchError(f"{method} {path} returned HTTP {response.status}: {document!r}")
+        raise BenchError(
+            f"{method} {path} returned HTTP {response.status}: {document!r}"
+        )
     return document, elapsed
 
 
-def stream_request(base: str, body: dict, timeout: float = 1800.0) -> tuple[dict, float, float | None, int]:
+def stream_request(
+    base: str, body: dict, timeout: float = 1800.0
+) -> tuple[dict, float, float | None, int]:
     host = base.removeprefix("http://").removeprefix("https://").rstrip("/")
     if "/" in host:
         host = host.split("/", 1)[0]
@@ -123,11 +135,16 @@ def stream_request(base: str, body: dict, timeout: float = 1800.0) -> tuple[dict
     committed_events = 0
     try:
         connection.request(
-            "POST", "/v1/chat/completions", payload, {"Content-Type": "application/json"}
+            "POST",
+            "/v1/chat/completions",
+            payload,
+            {"Content-Type": "application/json"},
         )
         response = connection.getresponse()
         if response.status != 200:
-            raise BenchError(f"stream returned HTTP {response.status}: {response.read()[:400]!r}")
+            raise BenchError(
+                f"stream returned HTTP {response.status}: {response.read()[:400]!r}"
+            )
         for raw_line in response.read().splitlines():
             if not raw_line.startswith(b"data: "):
                 continue
@@ -152,9 +169,12 @@ def stream_request(base: str, body: dict, timeout: float = 1800.0) -> tuple[dict
         if document.get("metrics") is not None:
             final = document
             break
-    return final, time.monotonic() - started, (
-        None if first_content is None else first_content - started
-    ), committed_events
+    return (
+        final,
+        time.monotonic() - started,
+        (None if first_content is None else first_content - started),
+        committed_events,
+    )
 
 
 def prompt_for(target_tokens: int, nonce: str, suffix: str = "") -> str:
@@ -207,7 +227,9 @@ def run_one(base: str, model: str, prompt: str, reasoning: str, output_tokens: i
     }
     return {
         "prompt_tokens": usage.get("prompt_tokens"),
-        "cached_prompt_tokens": usage.get("prompt_tokens_details", {}).get("cached_tokens"),
+        "cached_prompt_tokens": usage.get("prompt_tokens_details", {}).get(
+            "cached_tokens"
+        ),
         "output_tokens_committed": usage.get("completion_tokens", streamed_tokens),
         "prefill_seconds": native_delta["prefill_wall_ms"] / 1000.0,
         "decode_seconds": native_delta["decode_wall_ms"] / 1000.0,
@@ -221,7 +243,9 @@ def run_one(base: str, model: str, prompt: str, reasoning: str, output_tokens: i
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default=os.environ.get("SPLASH_BENCH_URL", "http://127.0.0.1:8000"))
+    parser.add_argument(
+        "--url", default=os.environ.get("SPLASH_BENCH_URL", "http://127.0.0.1:8000")
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -232,27 +256,37 @@ def main() -> int:
     )
     parser.add_argument("--model-manifest", type=Path)
     parser.add_argument("--capability-probe", type=Path)
-    parser.add_argument("--contexts", type=parse_contexts, default=[512, 4096, 16384, 32768])
+    parser.add_argument(
+        "--contexts", type=parse_contexts, default=[512, 4096, 16384, 32768]
+    )
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--reasoning-effort", default="none")
-    parser.add_argument("--scenario", choices=("uncached", "exact", "append", "all"), default="all")
+    parser.add_argument(
+        "--scenario", choices=("uncached", "exact", "append", "all"), default="all"
+    )
     args = parser.parse_args()
     if args.samples <= 0 or args.warmup < 0 or args.output_tokens <= 0:
-        parser.error("samples/output-tokens must be positive and warmup must be nonnegative")
+        parser.error(
+            "samples/output-tokens must be positive and warmup must be nonnegative"
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = args.model_manifest
     if manifest_path is None:
         manifest_path = args.root / "install/models" / args.model / "manifest.json"
-    metadata = build_metadata(args.root, args.model, manifest_path, args.capability_probe)
+    metadata = build_metadata(
+        args.root, args.model, manifest_path, args.capability_probe
+    )
     sampling = {
         "temperature": 0,
         "reasoning_effort": args.reasoning_effort,
         "stream": True,
     }
-    scenarios = ("uncached", "exact", "append") if args.scenario == "all" else (args.scenario,)
+    scenarios = (
+        ("uncached", "exact", "append") if args.scenario == "all" else (args.scenario,)
+    )
     run_manifest = {
         "runner": "bench_m1_ultra.py",
         "run_id": uuid.uuid4().hex,
@@ -273,7 +307,13 @@ def main() -> int:
         output.write(json.dumps({"record_type": "manifest", **run_manifest}) + "\n")
         for warmup in range(args.warmup):
             prompt = prompt_for(128, f"warmup-{run_manifest['run_id']}-{warmup}")
-            run_one(args.url, args.model, prompt, args.reasoning_effort, min(32, args.output_tokens))
+            run_one(
+                args.url,
+                args.model,
+                prompt,
+                args.reasoning_effort,
+                min(32, args.output_tokens),
+            )
         for scenario in scenarios:
             for sample in range(args.samples):
                 for requested in args.contexts:
@@ -282,10 +322,19 @@ def main() -> int:
                     if scenario == "append":
                         prompt += "\nAppend-only suffix: compare the final two implementation choices."
                     if scenario == "exact":
-                        run_one(args.url, args.model, prompt, args.reasoning_effort, args.output_tokens)
+                        run_one(
+                            args.url,
+                            args.model,
+                            prompt,
+                            args.reasoning_effort,
+                            args.output_tokens,
+                        )
                         measured_prompt = prompt
                     elif scenario == "append":
-                        measured_prompt = prompt + "\nNew suffix for the next turn: give one concise conclusion."
+                        measured_prompt = (
+                            prompt
+                            + "\nNew suffix for the next turn: give one concise conclusion."
+                        )
                     else:
                         measured_prompt = prompt
                     measured = run_one(

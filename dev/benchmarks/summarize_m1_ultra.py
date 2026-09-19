@@ -9,7 +9,6 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-
 REQUIRED = {
     "run_id",
     "scenario",
@@ -82,8 +81,7 @@ def summarize(records: list[dict]) -> list[dict]:
             if row["decode_seconds"] and row["native_delta"]["decode_output_tokens"]
         ]
         effective = [
-            row["rendered_prompt_tokens"]
-            / row["http_ttft_seconds"]
+            row["rendered_prompt_tokens"] / row["http_ttft_seconds"]
             for row in rows
             if row["http_ttft_seconds"]
         ]
@@ -97,9 +95,15 @@ def summarize(records: list[dict]) -> list[dict]:
                 ),
                 "native_prefill_tok_s": median_row(prefill) if prefill else None,
                 "native_decode_tok_s": median_row(decode) if decode else None,
-                "effective_http_prefill_tok_s": median_row(effective) if effective else None,
+                "effective_http_prefill_tok_s": median_row(effective)
+                if effective
+                else None,
                 "http_ttft_ms": median_row(
-                    [row["http_ttft_seconds"] * 1000 for row in rows if row["http_ttft_seconds"]]
+                    [
+                        row["http_ttft_seconds"] * 1000
+                        for row in rows
+                        if row["http_ttft_seconds"]
+                    ]
                 ),
                 "output_tokens": median_row(
                     [float(row["output_tokens_committed"]) for row in rows]
@@ -112,14 +116,18 @@ def summarize(records: list[dict]) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
-    parser.add_argument("--json", action="store_true", help="emit machine-readable summary")
+    parser.add_argument(
+        "--json", action="store_true", help="emit machine-readable summary"
+    )
     args = parser.parse_args()
     manifest, records = load(args.input)
     output = {"manifest": manifest, "summary": summarize(records)}
     if args.json:
         print(json.dumps(output, indent=2, sort_keys=True))
     else:
-        print("scenario requested actual cached prefill_tok/s decode_tok/s TTFT_ms output")
+        print(
+            "scenario requested actual cached prefill_tok/s decode_tok/s TTFT_ms output"
+        )
         for row in output["summary"]:
             prefill = row["native_prefill_tok_s"]
             decode = row["native_decode_tok_s"]

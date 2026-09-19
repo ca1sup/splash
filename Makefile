@@ -41,8 +41,8 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 SPLASH_APPLE7 ?= 0
-SPLASH_APPLE7_FLAG = -DSPLASH_APPLE7=$(if $(filter 1 true yes,$(SPLASH_APPLE7)),1,0)
-PROD_METALFLAGS = -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
+SPLASH_APPLE7_FLAG := -DSPLASH_APPLE7=$(if $(filter 1 true yes,$(SPLASH_APPLE7)),1,0)
+PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(SPLASH_APPLE7_FLAG) \
 	$(MACOS_TARGET_FLAG)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
