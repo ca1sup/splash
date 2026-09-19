@@ -410,8 +410,6 @@ def main() -> int:
                     for requested in args.contexts:
                         nonce = f"{scenario}-{args.corpus_seed}-{sample}-{requested}"
                         prompt = prompt_for(requested, nonce)
-                        if scenario == "append":
-                            prompt += "\nAppend-only suffix: compare the final two implementation choices."
                         warmup_prompt, measured_prompt = (
                             scenario_warmup_and_measurement(scenario, prompt)
                         )
