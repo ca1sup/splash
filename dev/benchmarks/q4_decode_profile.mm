@@ -93,7 +93,7 @@ double median(std::vector<double> samples) {
 
 std::vector<uint32_t> groupCandidates(uint32_t tiles, uint32_t referenceGroups) {
   std::vector<uint32_t> groups{referenceGroups, tiles, tiles / 2, tiles / 4,
-                               tiles / 8,  20,        40,        60,
+                               tiles / 8,  20,        40,        60,       64,
                                80,         120,       160,       240,
                                320,        480,       640};
   std::erase_if(groups, [tiles](uint32_t g) { return g == 0 || g > tiles; });
