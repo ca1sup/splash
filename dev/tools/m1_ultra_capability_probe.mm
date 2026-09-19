@@ -6,6 +6,7 @@
 #include <IOKit/IOKitLib.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -111,6 +112,17 @@ struct PipelineResult {
   NSUInteger threadExecutionWidth = 0;
   NSUInteger maxThreads = 0;
   NSUInteger staticThreadgroupBytes = 0;
+  std::string error;
+};
+
+struct TimedPipelineResult final {
+  bool compiled = false;
+  bool executed = false;
+  NSUInteger threadExecutionWidth = 0;
+  NSUInteger maxThreads = 0;
+  double gpuSeconds = 0.0;
+  double wallSeconds = 0.0;
+  double operationsPerSecond = 0.0;
   std::string error;
 };
 
@@ -252,6 +264,81 @@ void printPipeline(std::ostringstream &out, const PipelineResult &result) {
       << jsonEscape(result.error.c_str()) << "\"}";
 }
 
+TimedPipelineResult timePipeline(id<MTLDevice> device, id<MTLLibrary> library,
+                                 NSString *name, NSUInteger dispatchThreads,
+                                 uint32_t iterations,
+                                 id<MTLCommandQueue> queue) {
+  TimedPipelineResult result;
+  NSError *error = nil;
+  id<MTLFunction> function = [library newFunctionWithName:name];
+  if (!function) {
+    result.error = "function not found";
+    return result;
+  }
+  id<MTLComputePipelineState> pipeline =
+      [device newComputePipelineStateWithFunction:function error:&error];
+  if (!pipeline) {
+    result.error = errorString(error);
+    return result;
+  }
+  result.compiled = true;
+  result.threadExecutionWidth = pipeline.threadExecutionWidth;
+  result.maxThreads = pipeline.maxTotalThreadsPerThreadgroup;
+  id<MTLBuffer> output = [device
+      newBufferWithLength:dispatchThreads * sizeof(uint16_t)
+                  options:MTLResourceStorageModeShared];
+  id<MTLBuffer> iterationBuffer =
+      [device newBufferWithBytes:&iterations
+                          length:sizeof(iterations)
+                         options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> command = [queue commandBuffer];
+  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+  if (!output || !iterationBuffer || !command || !encoder) {
+    result.error = "timed pipeline resources unavailable";
+    return result;
+  }
+  [encoder setComputePipelineState:pipeline];
+  [encoder setBuffer:output offset:0 atIndex:0];
+  [encoder setBuffer:iterationBuffer offset:0 atIndex:1];
+  const NSUInteger width = std::max<NSUInteger>(1, pipeline.threadExecutionWidth);
+  const NSUInteger maxThreads =
+      std::min(dispatchThreads, pipeline.maxTotalThreadsPerThreadgroup);
+  [encoder dispatchThreads:MTLSizeMake(dispatchThreads, 1, 1)
+     threadsPerThreadgroup:MTLSizeMake(std::max(width, maxThreads), 1, 1)];
+  [encoder endEncoding];
+  const auto wallStart = std::chrono::steady_clock::now();
+  [command commit];
+  [command waitUntilCompleted];
+  const auto wallEnd = std::chrono::steady_clock::now();
+  result.wallSeconds =
+      std::chrono::duration<double>(wallEnd - wallStart).count();
+  if (command.status != MTLCommandBufferStatusCompleted) {
+    result.error = command.error ? errorString(command.error)
+                                 : "timed command buffer did not complete";
+    return result;
+  }
+  result.executed = true;
+  if (command.GPUStartTime > 0.0 && command.GPUEndTime >= command.GPUStartTime)
+    result.gpuSeconds = command.GPUEndTime - command.GPUStartTime;
+  if (result.gpuSeconds <= 0.0) result.gpuSeconds = result.wallSeconds;
+  const double operations = static_cast<double>(dispatchThreads) * iterations;
+  result.operationsPerSecond =
+      result.gpuSeconds > 0.0 ? operations / result.gpuSeconds : 0.0;
+  return result;
+}
+
+void printTimedPipeline(std::ostringstream &out,
+                        const TimedPipelineResult &result) {
+  out << "{\"compiled\":" << (result.compiled ? "true" : "false")
+      << ",\"executed\":" << (result.executed ? "true" : "false")
+      << ",\"thread_execution_width\":" << result.threadExecutionWidth
+      << ",\"max_threads_per_threadgroup\":" << result.maxThreads
+      << ",\"gpu_seconds\":" << result.gpuSeconds
+      << ",\"wall_seconds\":" << result.wallSeconds
+      << ",\"operations_per_second\":" << result.operationsPerSecond
+      << ",\"error\":\"" << jsonEscape(result.error.c_str()) << "\"}";
+}
+
 } // namespace
 
 int main() {
@@ -326,7 +413,21 @@ int main() {
                         "uint id [[thread_position_in_grid]]) { out[id] = bfloat(id); }\n"
                         "kernel void probe_simd_matrix(device float *out [[buffer(0)]], "
                         "uint id [[thread_index_in_threadgroup]]) { "
-                        "simdgroup_matrix<float, 8, 8> m; if (id == 0) out[0] = 1.0f; }\n";
+                        "simdgroup_matrix<float, 8, 8> m; if (id == 0) out[0] = 1.0f; }\n"
+                        "kernel void probe_half_math(device half *out [[buffer(0)]], "
+                        "constant uint &iterations [[buffer(1)]], "
+                        "uint id [[thread_position_in_grid]]) { "
+                        "half value = half((id & 31u) + 1u); "
+                        "for (uint i = 0; i < iterations; ++i) "
+                        "value = value * half(1.0001f) + half(0.0001f); "
+                        "out[id] = value; }\n"
+                        "kernel void probe_bfloat_math(device bfloat *out [[buffer(0)]], "
+                        "constant uint &iterations [[buffer(1)]], "
+                        "uint id [[thread_position_in_grid]]) { "
+                        "bfloat value = bfloat((id & 31u) + 1u); "
+                        "for (uint i = 0; i < iterations; ++i) "
+                        "value = value * bfloat(1.0001f) + bfloat(0.0001f); "
+                        "out[id] = value; }\n";
     id<MTLLibrary> library = [device newLibraryWithSource:source
                                                   options:options
                                                     error:&error];
@@ -340,6 +441,17 @@ int main() {
       printPipeline(out, makePipeline(device, library, @"probe_bfloat", 64, queue));
       out << ",\"simd_matrix_pipeline\":";
       printPipeline(out, makePipeline(device, library, @"probe_simd_matrix", 32, queue));
+      constexpr NSUInteger kMathThreads = 32768;
+      constexpr uint32_t kMathIterations = 2048;
+      out << ",\"fp16_bf16_diagnostic\":{\"threads\":"
+          << kMathThreads << ",\"iterations\":" << kMathIterations
+          << ",\"half\":";
+      printTimedPipeline(out, timePipeline(device, library, @"probe_half_math",
+                                           kMathThreads, kMathIterations, queue));
+      out << ",\"bfloat\":";
+      printTimedPipeline(out, timePipeline(device, library, @"probe_bfloat_math",
+                                           kMathThreads, kMathIterations, queue));
+      out << '}';
       out << '}';
     }
 
