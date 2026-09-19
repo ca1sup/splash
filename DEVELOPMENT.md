@@ -158,6 +158,7 @@ file:
 python3 dev/benchmarks/bench_m1_ultra.py \
   --url http://127.0.0.1:18000 \
   --model incoai/Qwen3.8-27B-Splash \
+  --corpus-seed splash-m1-ultra-corpus-v1 \
   --output /path/to/experiments/splash-m1-ultra.jsonl
 python3 dev/benchmarks/summarize_m1_ultra.py \
   /path/to/experiments/splash-m1-ultra.jsonl
@@ -165,7 +166,16 @@ python3 dev/benchmarks/summarize_m1_ultra.py \
 
 The `uncached`, `exact`, and `append` scenarios are reported separately. A
 prefix hit is not presented as ordinary native prefill: cached prompt tokens
-and newly evaluated tokens remain distinct.
+and newly evaluated tokens remain distinct. Use the same corpus seed and
+settings for a paired candidate, then compare it explicitly:
+
+```sh
+python3 dev/benchmarks/summarize_m1_ultra.py \
+  baseline.jsonl --compare candidate.jsonl
+```
+
+The summarizer refuses mismatched model, prompt corpus, sampling, or output
+settings, and reports candidate/reference ratios by context and scenario.
 
 ## Package
 

@@ -263,6 +263,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--reasoning-effort", default="none")
+    parser.add_argument("--corpus-seed", default="splash-m1-ultra-corpus-v1")
     parser.add_argument(
         "--scenario", choices=("uncached", "exact", "append", "all"), default="all"
     )
@@ -297,6 +298,7 @@ def main() -> int:
         "warmup": args.warmup,
         "output_tokens_requested": args.output_tokens,
         "reasoning_effort": args.reasoning_effort,
+        "corpus_seed": args.corpus_seed,
         "scenarios": scenarios,
         "clock": "time.monotonic",
         **metadata,
@@ -306,7 +308,7 @@ def main() -> int:
     with args.output.open("a", encoding="utf-8") as output:
         output.write(json.dumps({"record_type": "manifest", **run_manifest}) + "\n")
         for warmup in range(args.warmup):
-            prompt = prompt_for(128, f"warmup-{run_manifest['run_id']}-{warmup}")
+            prompt = prompt_for(128, f"warmup-{args.corpus_seed}-{warmup}")
             run_one(
                 args.url,
                 args.model,
@@ -317,7 +319,7 @@ def main() -> int:
         for scenario in scenarios:
             for sample in range(args.samples):
                 for requested in args.contexts:
-                    nonce = f"{scenario}-{run_manifest['run_id']}-{sample}-{requested}"
+                    nonce = f"{scenario}-{args.corpus_seed}-{sample}-{requested}"
                     prompt = prompt_for(requested, nonce)
                     if scenario == "append":
                         prompt += "\nAppend-only suffix: compare the final two implementation choices."
@@ -361,6 +363,7 @@ def main() -> int:
                         "http_ttft_seconds": measured["http_ttft_seconds"],
                         "request_seconds": measured["request_seconds"],
                         "reasoning_mode": args.reasoning_effort,
+                        "corpus_seed": args.corpus_seed,
                         "sampling_config_hash": run_manifest["sampling_config_hash"],
                         "cache_mode": scenario,
                         "concurrency": 1,
